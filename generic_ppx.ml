@@ -8,6 +8,8 @@ module CharSet = Set.Make(Char)
 
 let s c = String.make 1 c
 
+exception Not_known of char
+
 let ident_of_char c = match c with
   | 'a' .. 'z' ->
     s (Char.uppercase c)
@@ -61,8 +63,10 @@ let ident_of_char c = match c with
     "Dot"
   | '/' ->
     "Slash"
-  | _ ->
-    raise Exit
+  | ':' ->
+    "Colon"
+  | c ->
+    raise (Not_known c)
     (* Misc.fatal_error (Printf.sprintf "character %c" c) *)
 
 let chars =
@@ -115,6 +119,10 @@ let remaining_cases strset =
     Left (CharSet.fold aux set StringSet.empty)
   with Missing s -> Right s
 
+let char_of_ident id =
+  try StringMap.find id strmap
+  with Not_found -> assert false
+
 let loc_char i loc =
   let loc_start =
     { loc.loc_start with
@@ -147,18 +155,96 @@ module Main : sig end = struct
   let is_special_operator s =
     String.length s > 1 && s.[0] = '!'
 
+  let rec replace_last_ident s = function
+    | Longident.Lident _ -> Longident.Lident s
+    | Ldot(t,_) -> Ldot(t,s)
+    | Lapply(t1,t2) -> Lapply(t1,replace_last_ident s t2)
+
+
+  class char_mapper c = object
+    inherit Ast_mapper.mapper as parent
+    method! expr expr =
+      match expr.pexp_desc with
+      | Pexp_construct ({ txt = Lident "CHAR" }, None, _) ->
+        let pexp_desc = Pexp_constant (Const_char c) in
+        { expr with pexp_desc }
+      | _ -> parent#expr expr
+
+  end
+
+  let map_char c expr =
+    match expr.pexp_desc with
+    | Pexp_construct ({ txt = Lident "CHAR" }, None, _) ->
+      let pexp_desc = Pexp_constant (Const_char c) in
+      { expr with pexp_desc }
+    | _ -> Ast_mapper.E.map (new char_mapper c) expr
+
+  let map_pattern expr pats f =
+    let aux (p,e) = function
+      | None -> None (* some pattern with the wrong shape *)
+      | Some (r,l,set) -> match p.ppat_desc with
+        | Ppat_construct ({ txt = lident }, _, _) ->
+          begin match Longident.last lident with
+            | "OTHERS" ->
+              Some (Some (p, e), l, set)
+            | s ->
+              let set = StringSet.add s set in
+              match e.pexp_desc with
+              | Pexp_construct ({ txt = Lident "DROP" }, None, _) ->
+                Some (r,l,set)
+              | _ ->
+                Some (r,(p,e)::l,set)
+          end
+        | _ -> None
+    in
+    begin match List.fold_right aux pats (Some (None,[],StringSet.empty)) with
+      | None -> expr
+      | Some (special_pattern, rest, used_cases) ->
+        match remaining_cases used_cases with
+        | Right s ->
+          expr
+        | Left remainings ->
+          match special_pattern with
+          | None -> expr
+          | Some (p,e) ->
+            let make_case s =
+              match p.ppat_desc with
+              | Ppat_construct ({ txt = lident } as li, subpat, b) ->
+                let ppat_desc =
+                  Ppat_construct ({ li with txt = replace_last_ident s lident },
+                                  subpat, b) in
+                let e = map_char (char_of_ident s) e in
+                { p with ppat_desc }, e
+              | _ -> assert false
+            in
+            let cases = StringSet.fold (fun s l -> make_case s :: l) remainings rest in
+            { expr with pexp_desc = f cases }
+    end
+
   class mapper = object
     inherit Ast_mapper.mapper as parent
-    method! expr expr = match expr.pexp_desc with
+    method! expr expr =
+      let expr = parent#expr expr in
+      match expr.pexp_desc with
       | Pexp_apply
-          ( { pexp_desc = Pexp_ident { txt = Lident op_ident } } as fun_exp,
+          ( { pexp_desc =
+                Pexp_ident { txt = Lident op_ident } } as
+            fun_exp,
             [label,{ pexp_loc; pexp_desc = Pexp_constant (Const_string s) }] )
         when is_special_operator op_ident ->
         { expr with
           pexp_desc =
             Pexp_apply (fun_exp, [label, to_constructors pexp_loc s])}
 
-      | _ -> parent#expr expr
+      | Pexp_match ( cond, pats ) ->
+        map_pattern expr pats
+          (fun pats -> Pexp_match ( cond, pats ))
+
+      | Pexp_function (label, lab_def, pats) ->
+        map_pattern expr pats
+          (fun pats -> Pexp_function (label, lab_def, pats))
+
+      | _ -> expr
 
     method! type_declaration typedecl = match typedecl.ptype_kind with
       | Ptype_abstract | Ptype_record _ -> typedecl
